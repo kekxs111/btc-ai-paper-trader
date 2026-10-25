@@ -16,7 +16,6 @@ st.set_page_config(
 
 @st.cache_data(ttl=30)
 def get_btc_data():
-    """Holt aktuelle BTC-Daten"""
     try:
         df = yf.download("BTC-USD", period="14d", interval="1h", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -33,29 +32,55 @@ def add_indicators(df):
     df["RSI"] = ta.momentum.rsi(df["Close"], window=14)
     return df
 
-def get_signal(row, has_position: bool):
+def get_signal_and_size(row, cash, btc, price):
     """
-    Aggressivere Logik:
-    - Wenn noch keine Position: leichter kaufen
-    - Wenn Position offen: leichter verkaufen
+    Entscheidet Signal + angemessene Positionsgröße.
+    Gibt zurück: (signal, size_usd, size_btc)
     """
     if pd.isna(row["RSI"]) or pd.isna(row["SMA10"]):
-        return "HOLD"
+        return "HOLD", 0.0, 0.0
     
     rsi = float(row["RSI"])
     close = float(row["Close"])
     sma10 = float(row["SMA10"])
+    has_position = btc > 0.0001
+    portfolio_value = cash + (btc * price)
     
-    if not has_position:
-        # Noch kein BTC → möglichst schnell eine Position eröffnen
-        if rsi < 55 or close > sma10:
-            return "BUY"
-        return "HOLD"
-    else:
-        # Position ist offen → eher verkaufen
-        if rsi > 52 or close < sma10:
-            return "SELL"
-        return "HOLD"
+    # ----- KAUF-Logik -----
+    if rsi < 58 and close > sma10 * 0.998:
+        # Je niedriger der RSI, desto größer die Position (aber begrenzt)
+        if rsi < 35:
+            risk_pct = 0.22          # stark überverkauft → mehr einsetzen
+        elif rsi < 45:
+            risk_pct = 0.15
+        else:
+            risk_pct = 0.10          # nur leichtes Signal → kleiner
+        
+        # Maximal 25% des Gesamtportfolios pro Einzeltrade
+        max_trade = portfolio_value * 0.25
+        size_usd = min(cash * risk_pct, max_trade, cash * 0.95)
+        
+        if size_usd > 30:  # Mindestgröße
+            size_btc = size_usd / price
+            return "BUY", size_usd, size_btc
+    
+    # ----- VERKAUF-Logik -----
+    if has_position and (rsi > 52 or close < sma10):
+        # Je höher der RSI / je schwächer der Kurs, desto mehr verkaufen
+        if rsi > 70 or close < sma10 * 0.99:
+            sell_pct = 1.0           # alles verkaufen
+        elif rsi > 60:
+            sell_pct = 0.60
+        else:
+            sell_pct = 0.35          # nur Teilverkauf
+        
+        size_btc = btc * sell_pct
+        size_usd = size_btc * price
+        
+        if size_btc > 0.00005:
+            return "SELL", size_usd, size_btc
+    
+    return "HOLD", 0.0, 0.0
 
 # ==================== Session State ====================
 
@@ -70,43 +95,40 @@ def init_state():
         st.session_state.initial = 0.0
     if "trades" not in st.session_state:
         st.session_state.trades = []
-    if "last_price" not in st.session_state:
-        st.session_state.last_price = 0.0
 
-def do_trade(signal, price):
-    """Führt einen Trade aus und speichert ihn"""
+def do_trade(signal, size_usd, size_btc, price):
+    """Führt den Trade mit der vom Programm bestimmten Größe aus"""
     timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     
-    if signal == "BUY" and st.session_state.cash > 50 and st.session_state.btc < 0.0001:
-        # 50% des Kapitals einsetzen
-        amount = st.session_state.cash * 0.50
-        btc_amount = amount / price
-        
-        st.session_state.btc += btc_amount
-        st.session_state.cash -= amount
+    if signal == "BUY" and size_usd > 30 and st.session_state.cash >= size_usd:
+        st.session_state.btc += size_btc
+        st.session_state.cash -= size_usd
         
         st.session_state.trades.append({
             "Zeit": timestamp,
             "Aktion": "KAUF",
             "Preis": round(price, 2),
-            "BTC": round(btc_amount, 6),
-            "Wert USD": round(amount, 2)
+            "BTC": round(size_btc, 6),
+            "Wert USD": round(size_usd, 2)
         })
         return True
     
-    elif signal == "SELL" and st.session_state.btc > 0.0001:
-        value = st.session_state.btc * price
+    elif signal == "SELL" and size_btc > 0.00005 and st.session_state.btc >= size_btc:
+        st.session_state.btc -= size_btc
+        st.session_state.cash += size_usd
+        
+        # Aufräumen bei sehr kleinen Resten
+        if st.session_state.btc < 0.00005:
+            st.session_state.cash += st.session_state.btc * price
+            st.session_state.btc = 0.0
         
         st.session_state.trades.append({
             "Zeit": timestamp,
             "Aktion": "VERKAUF",
             "Preis": round(price, 2),
-            "BTC": round(st.session_state.btc, 6),
-            "Wert USD": round(value, 2)
+            "BTC": round(size_btc, 6),
+            "Wert USD": round(size_usd, 2)
         })
-        
-        st.session_state.cash += value
-        st.session_state.btc = 0.0
         return True
     
     return False
@@ -141,7 +163,7 @@ def main():
             st.session_state.started = True
             st.rerun()
         
-        st.info("Nach dem Start entscheidet das Programm selbst, wann es kauft und verkauft.")
+        st.info("Das Programm entscheidet selbst, wann und mit wie viel Geld es kauft oder verkauft. Mehrere Trades sind möglich.")
         return
     
     # ---------- Trading läuft ----------
@@ -154,16 +176,18 @@ def main():
     df = add_indicators(df)
     latest = df.iloc[-1]
     price = float(latest["Close"])
-    st.session_state.last_price = price
     
-    has_position = st.session_state.btc > 0.0001
-    signal = get_signal(latest, has_position)
+    signal, size_usd, size_btc = get_signal_and_size(
+        latest, 
+        st.session_state.cash, 
+        st.session_state.btc, 
+        price
+    )
     
-    # Automatisch traden
-    traded = do_trade(signal, price)
+    # Trade ausführen
+    traded = do_trade(signal, size_usd, size_btc, price)
     
-    # Nach dem Trade Status neu berechnen
-    has_position = st.session_state.btc > 0.0001
+    # Aktuellen Stand berechnen
     btc_value = st.session_state.btc * price
     total = st.session_state.cash + btc_value
     pnl = total - st.session_state.initial
@@ -175,15 +199,17 @@ def main():
     col2.metric("BTC-Preis", f"${price:,.2f}")
     col3.metric("Aktuelles Signal", signal)
     
-    # Klare Erklärung, warum gerade nichts passiert
-    if signal == "SELL" and not has_position:
-        st.warning("Signal ist **SELL**, aber es ist noch keine Position offen. Das Programm wartet auf ein **KAUF**-Signal.")
-    elif signal == "BUY" and has_position:
-        st.info("Signal ist **BUY**, aber es ist bereits eine Position offen.")
+    # Zusätzliche Info
+    col_a, col_b = st.columns(2)
+    col_a.write(f"Cash: **${st.session_state.cash:,.2f}**")
+    col_b.write(f"BTC Bestand: **{st.session_state.btc:.6f}**")
+    
+    if traded:
+        st.success(f"Trade ausgeführt: **{signal}** über ${size_usd:,.2f}")
     elif signal == "HOLD":
         st.info("Aktuell kein klares Signal → HOLD")
-    elif traded:
-        st.success(f"Trade gerade ausgeführt: **{signal}**")
+    else:
+        st.caption(f"Signal erkannt, aber Bedingungen für Ausführung nicht erfüllt (z. B. zu wenig Cash oder Position).")
     
     st.divider()
     
@@ -217,7 +243,6 @@ def main():
         st.session_state.trades = []
         st.rerun()
     
-    # Alle 30 Sekunden neu prüfen
     time.sleep(30)
     st.rerun()
 
