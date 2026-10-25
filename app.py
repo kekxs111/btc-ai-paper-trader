@@ -28,22 +28,27 @@ def get_btc_data():
 
 def add_indicators(df):
     df = df.copy()
+    df["SMA10"] = ta.trend.sma_indicator(df["Close"], window=10)
     df["SMA20"] = ta.trend.sma_indicator(df["Close"], window=20)
-    df["SMA50"] = ta.trend.sma_indicator(df["Close"], window=50)
     df["RSI"] = ta.momentum.rsi(df["Close"], window=14)
     return df
 
 def get_signal(row):
-    """Einfache regelbasierte Entscheidung"""
-    if pd.isna(row["RSI"]) or pd.isna(row["SMA20"]) or pd.isna(row["SMA50"]):
+    """Aggressivere regelbasierte Entscheidung – häufigere Signale"""
+    if pd.isna(row["RSI"]) or pd.isna(row["SMA10"]) or pd.isna(row["SMA20"]):
         return "HOLD"
     
-    # Kauf: RSI niedrig + Aufwärtstrend
-    if row["RSI"] < 35 and row["Close"] > row["SMA20"] and row["SMA20"] > row["SMA50"]:
+    rsi = row["RSI"]
+    close = row["Close"]
+    sma10 = row["SMA10"]
+    sma20 = row["SMA20"]
+    
+    # KAUF: häufiger – RSI unter 48 oder Kurs über SMA10 bei leichtem Aufwärtstrend
+    if rsi < 48 and close > sma10:
         return "BUY"
     
-    # Verkauf: RSI hoch oder unter SMA20
-    if row["RSI"] > 65 or row["Close"] < row["SMA20"]:
+    # VERKAUF: häufiger – RSI über 55 oder Kurs unter SMA10
+    if rsi > 55 or close < sma10:
         return "SELL"
     
     return "HOLD"
@@ -63,18 +68,22 @@ def init_state():
         st.session_state.trades = []
     if "last_price" not in st.session_state:
         st.session_state.last_price = 0.0
+    if "last_action" not in st.session_state:
+        st.session_state.last_action = None
 
 def do_trade(signal, price):
     """Führt einen Trade aus und speichert ihn"""
     timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     
-    if signal == "BUY" and st.session_state.cash > 50:
-        # 30% des aktuellen Cash einsetzen
-        amount = st.session_state.cash * 0.30
+    # Verhindert doppelte Käufe hintereinander ohne Verkauf
+    if signal == "BUY" and st.session_state.cash > 50 and st.session_state.last_action != "BUY":
+        # 40% des aktuellen Cash einsetzen (etwas aggressiver)
+        amount = st.session_state.cash * 0.40
         btc_amount = amount / price
         
         st.session_state.btc += btc_amount
         st.session_state.cash -= amount
+        st.session_state.last_action = "BUY"
         
         st.session_state.trades.append({
             "Zeit": timestamp,
@@ -98,6 +107,7 @@ def do_trade(signal, price):
         
         st.session_state.cash += value
         st.session_state.btc = 0.0
+        st.session_state.last_action = "SELL"
         return True
     
     return False
@@ -108,7 +118,7 @@ def main():
     init_state()
     
     st.title("₿ BTC Auto Trader")
-    st.caption("Nur Simulation · Kein echtes Geld")
+    st.caption("Nur Simulation · Kein echtes Geld · Häufigere Signale")
     
     # ---------- Startbildschirm: Nur Kapital einstellen ----------
     if not st.session_state.started:
@@ -129,15 +139,15 @@ def main():
             st.session_state.btc = 0.0
             st.session_state.initial = float(capital)
             st.session_state.trades = []
+            st.session_state.last_action = None
             st.session_state.started = True
             st.rerun()
         
-        st.info("Nach dem Start tradet das Programm automatisch und zeigt dir die ausgeführten Trades an.")
+        st.info("Nach dem Start entscheidet das Programm selbst, wann es kauft und verkauft. Du siehst nur die ausgeführten Trades.")
         return
     
     # ---------- Trading läuft ----------
     
-    # Aktuelle Daten holen
     df = get_btc_data()
     if df.empty:
         st.error("Kursdaten konnten nicht geladen werden. Bitte Seite neu laden.")
@@ -163,7 +173,7 @@ def main():
     col1, col2, col3 = st.columns(3)
     col1.metric("Aktueller Stand", f"${total:,.2f}", f"{pnl_pct:+.2f}%")
     col2.metric("BTC-Preis", f"${price:,.2f}")
-    col3.metric("Letztes Signal", signal)
+    col3.metric("Aktuelles Signal", signal)
     
     st.divider()
     
@@ -172,7 +182,6 @@ def main():
     
     if st.session_state.trades:
         trades_df = pd.DataFrame(st.session_state.trades)
-        # Neueste zuerst
         trades_df = trades_df.iloc[::-1].reset_index(drop=True)
         
         st.dataframe(
@@ -190,18 +199,18 @@ def main():
         
         st.caption(f"Anzahl Trades: {len(st.session_state.trades)}")
     else:
-        st.info("Noch keine Trades. Das Programm wartet auf ein klares Signal...")
+        st.info("Noch keine Trades. Das Programm wartet auf ein Signal...")
     
     st.divider()
     
-    # Stop-Button
     if st.button("Trading stoppen & zurücksetzen", use_container_width=True):
         st.session_state.started = False
         st.session_state.trades = []
+        st.session_state.last_action = None
         st.rerun()
     
-    # Automatisch alle 45 Sekunden neu prüfen
-    time.sleep(45)
+    # Alle 40 Sekunden neu prüfen
+    time.sleep(40)
     st.rerun()
 
 if __name__ == "__main__":
